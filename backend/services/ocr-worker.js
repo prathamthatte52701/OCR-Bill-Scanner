@@ -40,9 +40,19 @@ async function run() {
     } catch { return buf }
   }
 
-  async function recognize(worker, imgBuf, psm) {
+  async function recognize(worker, imgBuf, psm, withWords = false) {
     await worker.setParameters({ tessedit_pageseg_mode: psm, preserve_interword_spaces: '1' })
-    const { data } = await worker.recognize(imgBuf)
+    // tesseract.js v7 only populates data.blocks (and therefore word-level bboxes)
+    // when explicitly requested via the third options argument - without it,
+    // data.blocks is null and data.words does not exist at all.
+    const { data } = withWords
+      ? await worker.recognize(imgBuf, {}, { blocks: true })
+      : await worker.recognize(imgBuf)
+    if (withWords) {
+      const words = []
+      ;(data.blocks || []).forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => (l.words || []).forEach(w => words.push(w)))))
+      data.words = words
+    }
     return data
   }
 
@@ -72,7 +82,7 @@ async function run() {
   // so the split still works if a page is scanned slightly differently sized.
   async function findSplitY(worker, imgBuf, pageHeight) {
     try {
-      const data = await recognize(worker, imgBuf, 6)
+      const data = await recognize(worker, imgBuf, 6, true)
       const words = data.words || []
 
       const findWordY = (predicate) => {

@@ -3,14 +3,14 @@ import { useNavigate } from 'react-router-dom'
 import api from '../utils/api'
 import UploadCard from '../components/UploadCard'
 import DocumentPreview from '../components/DocumentPreview'
-import transportRouteVisual from '../assets/transport-bill-route-visual.png'
+import challanRouteVisual from '../assets/transport-bill-route-visual.png'
 
 function LogisticsUploadIllustration() {
   return (
     <div className="relative mt-10 hidden min-h-[310px] overflow-hidden rounded-[30px] border border-blue-300/10 bg-slate-950/20 lg:block">
       <img
-        src={transportRouteVisual}
-        alt="Transport bill upload route extraction visual"
+        src={challanRouteVisual}
+        alt="Delivery challan upload route extraction visual"
         className="absolute inset-0 h-full w-full object-cover object-center"
       />
       <div className="absolute inset-0 bg-gradient-to-t from-slate-950/55 via-transparent to-slate-950/10" />

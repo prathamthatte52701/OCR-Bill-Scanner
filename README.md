@@ -128,7 +128,7 @@ npm run dev
 
 ## How Table Extraction Works
 
-- The backend builds display tables from structured AI-extracted transport fields
+- The backend builds display tables from structured AI-extracted consignor/consignee fields
 - Each table has: `title`, `columns[]`, `rows[]`, `confidence`, `sourceHint`
 - Tables are rendered in horizontally scrollable views on mobile
 - If extraction is uncertain, the AI adds a warning

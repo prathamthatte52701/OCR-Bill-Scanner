@@ -56,7 +56,7 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/docintel', 
       console.warn(`Requeued ${recoveredCount} interrupted document(s) for processing.`)
     }
     app.listen(PORT, () => {
-      console.log(`Transport Bill Intelligence Server running on port ${PORT}`)
+      console.log(`Consignor/Consignee Delivery Challan Intelligence Server running on port ${PORT}`)
     })
   })
   .catch((err) => {

@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom'
 import { useState, useEffect } from 'react'
 import api from '../utils/api'
-import transportRouteVisual from '../assets/transport-bill-route-visual.png'
+import challanRouteVisual from '../assets/transport-bill-route-visual.png'
 
 const features = [
   { icon: 'UP', title: 'Upload', desc: 'Upload delivery challans in JPG, JPEG, PNG, or PDF.' },
@@ -107,7 +107,7 @@ function HeroIllustration() {
   return (
     <div className="relative min-h-[270px] overflow-hidden rounded-[28px] border border-blue-300/12 bg-slate-950/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
       <img
-        src={transportRouteVisual}
+        src={challanRouteVisual}
         alt="AI delivery challan route extraction visual"
         className="absolute inset-0 h-full w-full object-cover object-center"
       />
@@ -327,7 +327,7 @@ export default function Dashboard() {
         </section>
 
         <section className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard icon="TD" label="Total Documents" value={stats.total} helper="Transport bills in workspace" color="blue" />
+          <StatCard icon="TD" label="Total Documents" value={stats.total} helper="Delivery challans in workspace" color="blue" />
           <StatCard icon="OK" label="Processed" value={stats.processed} helper="Ready for review and chat" color="green" />
           <StatCard icon="ER" label="Failed" value={stats.failed} helper="Needs reprocess or review" color="red" />
           <StatCard icon="24" label="Processed Today" value={stats.processedToday} helper="Completed in today's run" color="violet" />

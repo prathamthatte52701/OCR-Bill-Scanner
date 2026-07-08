@@ -18,14 +18,41 @@ function getKeyPool() {
 }
 
 let keyPool = null
-let nextKeyIndex = 0
+let nextStartIndex = 0
 
-function getClient() {
+// Runs a Groq request, failing over to the next key in the pool if the current
+// key is rate-limited/unauthorized/erroring server-side - so one exhausted key
+// doesn't take the whole pipeline down. Only fails over for capacity/auth/server
+// errors; a genuine bad-request error (e.g. malformed prompt) is not retried
+// with a different key since that would just fail again identically.
+//
+// Each call picks its own fixed starting index (advanced once, synchronously,
+// before any await) and then walks every key in the pool exactly once from
+// there. This keeps retries within one call from ever repeating a key, even
+// when multiple calls run concurrently (e.g. Part 1 + Part 2 in parallel) and
+// race over the shared round-robin counter.
+async function callGroqWithFailover(makeRequest) {
   if (keyPool === null) keyPool = getKeyPool()
   if (!keyPool.length) throw new Error('GROQ_API_KEY (or GROQ_API_KEYS) is not set')
-  const apiKey = keyPool[nextKeyIndex % keyPool.length]
-  nextKeyIndex++
-  return new Groq({ apiKey })
+
+  const startIndex = nextStartIndex % keyPool.length
+  nextStartIndex++
+
+  let lastError
+  for (let i = 0; i < keyPool.length; i++) {
+    const keyIndex = (startIndex + i) % keyPool.length
+    const client = new Groq({ apiKey: keyPool[keyIndex] })
+    try {
+      return await makeRequest(client)
+    } catch (err) {
+      lastError = err
+      const status = err?.status
+      const shouldFailover = status === 429 || status === 401 || status === 403 || (status >= 500 && status < 600)
+      console.warn(`Groq key #${keyIndex + 1}/${keyPool.length} failed (status ${status || 'unknown'}): ${err.message}${shouldFailover && i < keyPool.length - 1 ? ' - trying next key' : ''}`)
+      if (!shouldFailover) throw err
+    }
+  }
+  throw lastError
 }
 
 const PRINTED_ONLY_RULE = `
@@ -35,7 +62,7 @@ CRITICAL - PRINTED TEXT ONLY:
 - IGNORE anything that reads like a handwritten annotation, a stamp (e.g. "OUT-WARD UNIT", "SECURITY", "Sr. No ... Time Out ... Vh No", company rubber-stamp blocks), a signature name, or loose numbers/notes scribbled outside the form's own bordered cells.
 - If a printed field's value is genuinely obscured or unreadable because a stamp/pen mark overlaps it, set that field to null and add a warning - do NOT guess or substitute the handwritten text for it.`
 
-const PART1_SYSTEM = `You are a document extraction specialist for Indian "Delivery Challan" (Consignor-Consignee) documents issued under Rule 55 of CGST Rule.
+const PART1_SYSTEM = `You are a document extraction specialist for Indian company bills (consignor consignee bills) (Consignor-Consignee) documents issued under Rule 55 of CGST Rule.
 
 You will receive OCR text from the UPPER section of the bill only - this section is a two-column bordered table: Consignee details on the left, Consignor details on the right, plus challan metadata (Invoice No, FI Doc, Date, Reason, PO No, GSTIN/PAN, Request No, IRN No).
 
@@ -78,23 +105,30 @@ FIELD LABEL GUIDE:
 - Address spans multiple lines (street, city, pincode) - join into one field
 - "FI Doc" is a numeric document id, separate from "Invoice No"
 
-CHARACTER CORRECTION RULES - MANDATORY - APPLY BEFORE RETURNING GSTIN/PAN:
+CONSIGNEE vs CONSIGNOR DISAMBIGUATION - CRITICAL:
+- The OCR text loses the visual left/right column boundary, so lines from both parties often appear interleaved, merged, or out of order.
+- Everything from the start of the text up to (and not including) the line that introduces "VE Commercial Vehicles" / the Consignor's "Name" row belongs to Consignee. Everything from that point onward belongs to Consignor, until a field label clearly says "Consignee" again.
+- Never let an address fragment, state code, GSTIN, or PAN that belongs to one party end up attached to the other party just because the OCR lines were adjacent or out of order. If you cannot confidently tell which party a fragment belongs to, leave that specific sub-field null rather than attaching it to the wrong party.
+
+REFERENCE VALUES - this document type always has the same Consignor, and the same Consignee company (only branch address/state/GSTIN differ by location). Use these ONLY to sanity-check and correct clearly OCR-garbled values, never to overwrite a value that is already clearly and consistently read as something else in the text:
+- Consignor is always: name "VE Commercial Vehicles Ltd (UNIT - EEC)", address "87A Industrial Area No 3, A. B Road Dewas, 455001", state "Madhya Pradesh", stateCode "23", gstin "23AABCE9378F3ZI", pan "AABCE9378F".
+- Consignee company name is always "OERLIKON BALZERS COATING INDIA" and pan is always "AAACI3916N" regardless of branch; consignee address/state/stateCode/gstin vary by branch and must come from the OCR text, not from this reference.
+- If a value you're about to output for Consignor differs from its reference value, re-check whether it actually belongs to Consignee instead (a column mix-up) before accepting it as a genuine difference.
+
+CHARACTER CORRECTION RULES - CONSERVATIVE, NEVER FABRICATE:
 GSTIN format is always: 2 digits + 5 letters + 4 digits + 1 letter + 1 digit + "Z" + 1 digit (15 characters total).
 PAN format is always: 5 letters + 4 digits + 1 letter (10 characters total).
-OCR commonly confuses these characters - correct them using surrounding position context:
-- Position 13 of a GSTIN (the checksum-entity-code letter) is ALWAYS "Z" - if OCR shows "2", "7", or any digit there, correct it to "Z"
-- Where a DIGIT is expected but OCR shows a letter: S->5, O->0, I->1, Z->2, B->8, G->6
-- Where a LETTER is expected but OCR shows a digit: 5->S, 0->O, 1->I, 2->Z, 8->B, 6->G
-- Apply this positionally (digits-block vs letters-block per the format above), not by guessing
-- Log every correction you make in warnings, e.g. "Consignee GSTIN position 13: corrected 2->Z"
-- If a GSTIN/PAN is too garbled to confidently reconstruct the format, leave it as the best-effort OCR value and add a warning instead of fabricating characters
+- Only correct a character when the REST of the value already clearly matches the expected length/shape and the specific character is a well-known OCR confusable in that exact position (S<->5, O<->0, I<->1, Z<->2, B<->8, G<->6, or position-13 of a GSTIN which is always "Z").
+- Do NOT pad, invent, or reconstruct characters to force a garbled value into the right length or shape. If the OCR text does not contain enough recognizable characters to confidently reconstruct a valid GSTIN/PAN, return null for that field - do not guess.
+- NEVER write a justification like "assuming..." or "using standard format" to explain a value - if you find yourself doing that, you are fabricating; return null instead and say so in warnings.
+- Log every genuine single-character correction in warnings, e.g. "Consignee GSTIN position 13: corrected 2->Z"
 ${PRINTED_ONLY_RULE}
 
 NULL RULES:
 - null for every missing or unreadable field - never fabricate any value
 - Use warnings[] to log every field that was unclear, partially read, or excluded due to stamp/handwriting overlap`
 
-const PART2_SYSTEM = `You are a document extraction specialist for Indian "Delivery Challan" (Consignor-Consignee) documents issued under Rule 55 of CGST Rule.
+const PART2_SYSTEM = `You are a document extraction specialist for Indian company bills (consignor consignee bills) (Consignor-Consignee) documents issued under Rule 55 of CGST Rule.
 
 You will receive OCR text from the LOWER section of the bill only - this section is a single bordered table titled "UNCODED RGP" listing line items (SR No, Description, HSN/SAC, Basic, Quantity, Amount), followed by a totals footer (Total Basic Amount, CGST, SGST, IGST, Total Amount).
 
@@ -177,8 +211,7 @@ function parseJSON(raw) {
 }
 
 async function runExtraction(systemPrompt, ocrText, label) {
-  const client = getClient()
-  const response = await client.chat.completions.create({
+  const response = await callGroqWithFailover(client => client.chat.completions.create({
     model: 'llama-3.3-70b-versatile',
     messages: [
       { role: 'system', content: systemPrompt },
@@ -186,7 +219,7 @@ async function runExtraction(systemPrompt, ocrText, label) {
     ],
     temperature: 0.1,
     max_tokens: 4000,
-  })
+  }))
   return parseJSON(response.choices[0].message.content)
 }
 
@@ -479,7 +512,6 @@ TERMS TO UNDERSTAND:
 - HSN/SAC = tax classification code for each item`
 
 async function answerQuestion(question, docContext) {
-  const client = getClient()
   const { fields = [], tables = [], summaryPoints = [], ocrText = '' } = docContext
 
   const contextBlock = `
@@ -503,7 +535,7 @@ ${tables.length
 === RAW OCR TEXT ===
 ${ocrText || '(not available)'}`
 
-  const response = await client.chat.completions.create({
+  const response = await callGroqWithFailover(client => client.chat.completions.create({
     model: 'llama-3.3-70b-versatile',
     messages: [
       { role: 'system', content: CHAT_SYSTEM + '\n\n' + contextBlock },
@@ -511,7 +543,7 @@ ${ocrText || '(not available)'}`
     ],
     temperature: 0.2,
     max_tokens: 1000,
-  })
+  }))
 
   return response.choices[0].message.content
 }
