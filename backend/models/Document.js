@@ -71,6 +71,10 @@ const documentSchema = new mongoose.Schema({
   deletedAt: Date,
   // Training system - weight increases each time a field is corrected by user
   trainingWeight: { type: Number, default: 1 },
+  // normalizedKeys of every field ever manually corrected - persists across view
+  // regeneration so the "(edited)" indicator survives even though fields/tables
+  // are rebuilt from scratch on every correction.
+  editedFieldKeys: { type: [String], default: [] },
 
   // Consignor-Consignee delivery challan fields
   invoiceNo: { type: String, default: null },

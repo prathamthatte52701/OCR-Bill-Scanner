@@ -1,7 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const multer = require('multer')
-const mongoose = require('mongoose')
+const path = require('path')
 
 // -- Processing queue - max 1 OCR job at a time to prevent OOM crashes ---------
 let _processing = false
@@ -23,12 +23,7 @@ const Document = require('../models/Document')
 const Correction = require('../models/Correction')
 const { uploadBuffer, downloadBuffer, deleteFile } = require('../services/gridfs')
 const { extractParts } = require('../services/ocr')
-const { analyzeDocument } = require('../services/groq')
-
-const Counter = mongoose.models.Counter || mongoose.model('Counter', new mongoose.Schema({
-  _id: String,
-  seq: { type: Number, default: 0 },
-}, { versionKey: false }))
+const { analyzeDocument, assembleDocumentViews, applyCorrection } = require('../services/groq')
 
 const storage = multer.memoryStorage()
 const upload = multer({
@@ -71,33 +66,24 @@ function mimeMatchesUpload(declared, detected) {
   return declared === 'image/jpg' && detected === 'image/jpeg'
 }
 
-async function getNextAutoName() {
-  const counterId = 'documentAutoName'
-  const existing = await Counter.findById(counterId).lean()
-
-  if (!existing) {
-    const count = await Document.countDocuments({})
-    try {
-      await Counter.create({ _id: counterId, seq: count })
-    } catch (err) {
-      if (err.code !== 11000) throw err
-    }
-  }
-
-  const counter = await Counter.findByIdAndUpdate(
-    counterId,
-    { $inc: { seq: 1 } },
-    { new: true, upsert: true, setDefaultsOnInsert: true, lean: true }
-  )
-  return `File ${counter.seq}`
+// Document display name is the actual uploaded filename, extension stripped -
+// e.g. "delivery-challan-123.jpg" -> "delivery-challan-123".
+function nameFromOriginalFilename(originalname) {
+  return path.parse(originalname).name || originalname
 }
 
 async function getPDFPageCount(buffer) {
   try {
-    const pdfParse = require('pdf-parse')
-    const data = await pdfParse(buffer, { max: 0 }) // max:0 = parse metadata only
-    return data.numpages || 1
-  } catch {
+    const { PDFParse } = require('pdf-parse')
+    const parser = new PDFParse({ data: buffer })
+    try {
+      const info = await parser.getInfo() // metadata only, no text/page extraction
+      return info.total || 1
+    } finally {
+      await parser.destroy()
+    }
+  } catch (err) {
+    console.error('getPDFPageCount error:', err.message)
     return null
   }
 }
@@ -129,7 +115,7 @@ router.post('/upload', uploadMiddleware, async (req, res) => {
       }
     }
 
-    const autoName = await getNextAutoName()
+    const autoName = nameFromOriginalFilename(originalname)
     const gridFsFileId = await uploadBuffer(buffer, originalname, mimetype)
 
     const doc = await Document.create({
@@ -178,6 +164,12 @@ async function processDocument(docId, buffer, mimeType) {
       return
     }
 
+    // OCR-level warnings (e.g. "this scanned PDF has N pages, only page 1 was
+    // read") originate before the AI extraction step, so they aren't already
+    // part of groqResult.warnings - merge them in so they actually reach the user
+    // instead of only ever being logged to the server console.
+    const allWarnings = [...(ocrParts.ocrWarnings || []), ...(groqResult.warnings || [])]
+
     await updateActiveDocument(docId, {
       uploadStatus: 'processed',
       part1OcrTextHidden: ocrParts.part1Text || null,
@@ -201,8 +193,8 @@ async function processDocument(docId, buffer, mimeType) {
       totals: groqResult.totals || null,
       part1: groqResult.part1 ? { ocrText: ocrParts.part1Text || null, ...groqResult.part1 } : null,
       part2: groqResult.part2 ? { ocrText: ocrParts.part2Text || null, ...groqResult.part2 } : null,
-      warnings: groqResult.warnings || [],
-      extractionWarnings: groqResult.warnings || [],
+      warnings: allWarnings,
+      extractionWarnings: allWarnings,
       processingError: null,
       processedAt: new Date(),
     })
@@ -376,6 +368,7 @@ router.post('/:id/reprocess', async (req, res) => {
       part1: null,
       part2: null,
       extractionWarnings: [],
+      editedFieldKeys: [],
     })
 
     // Queue reprocessing - only 1 OCR job runs at a time to prevent OOM
@@ -428,31 +421,71 @@ router.patch('/:id/fields/:fieldKey/correct', async (req, res) => {
     if (fieldIndex === -1) return res.status(404).json({ error: 'Field not found.' })
 
     const trimmedValue = newValue.trim()
+    const priorLabel = doc.extractedFields[fieldIndex].label
     const priorValue = doc.extractedFields[fieldIndex].value
 
-    // Single source of truth: the edited value overwrites the field permanently -
-    // there is no separate "AI value" vs "edited value" anywhere. Sync every
-    // stored copy of this field (main list + Part 1/Part 2 snapshots) so the
-    // edit is reflected everywhere immediately and survives a refresh.
-    doc.extractedFields[fieldIndex].value = trimmedValue
-    doc.extractedFields[fieldIndex].edited = true
-
-    const syncCopy = (fieldsArray) => {
-      if (!fieldsArray) return
-      const idx = fieldsArray.findIndex(f => f.normalizedKey === req.params.fieldKey)
-      if (idx !== -1) {
-        fieldsArray[idx].value = trimmedValue
-        fieldsArray[idx].edited = true
-      }
+    // Single source of truth: write the edit into the CANONICAL structured data
+    // (consignee/consignor/totals/lineItems/header scalars), then regenerate
+    // every derived view (fields, tables, summaries, part1/part2) from that one
+    // corrected source. There is no separate "AI value" left anywhere afterward -
+    // the old value is gone, not just hidden behind a display override.
+    const canonical = {
+      consignee: doc.consignee ? doc.consignee.toObject() : null,
+      consignor: doc.consignor ? doc.consignor.toObject() : null,
+      invoiceNo: doc.invoiceNo,
+      fiDoc: doc.fiDoc,
+      challanDate: doc.challanDate,
+      reason: doc.reason,
+      poNo: doc.poNo,
+      requestNo: doc.requestNo,
+      irnNo: doc.irnNo,
+      lineItems: (doc.lineItems || []).map(item => item.toObject()),
+      totals: doc.totals ? doc.totals.toObject() : null,
     }
-    syncCopy(doc.part1?.fields)
-    syncCopy(doc.part2?.fields)
+
+    const applied = applyCorrection(canonical, req.params.fieldKey, trimmedValue)
+    if (!applied) {
+      return res.status(400).json({ error: 'This field cannot be edited.' })
+    }
+
+    if (!doc.editedFieldKeys.includes(req.params.fieldKey)) {
+      doc.editedFieldKeys.push(req.params.fieldKey)
+    }
+
+    const views = assembleDocumentViews(canonical, canonical)
+    const markEdited = (fields) => {
+      (fields || []).forEach(f => {
+        if (doc.editedFieldKeys.includes(f.normalizedKey)) f.edited = true
+      })
+    }
+    markEdited(views.fields)
+    markEdited(views.part1.fields)
+    markEdited(views.part2.fields)
+
+    doc.consignee = canonical.consignee
+    doc.consignor = canonical.consignor
+    doc.invoiceNo = canonical.invoiceNo
+    doc.fiDoc = canonical.fiDoc
+    doc.challanDate = canonical.challanDate
+    doc.reason = canonical.reason
+    doc.poNo = canonical.poNo
+    doc.requestNo = canonical.requestNo
+    doc.irnNo = canonical.irnNo
+    doc.lineItems = canonical.lineItems
+    doc.totals = canonical.totals
+
+    doc.extractedFields = views.fields
+    doc.extractedTables = views.tables
+    doc.fullSummary = views.fullSummary
+    doc.summaryPoints = views.summaryPoints
+    doc.part1 = { ocrText: doc.part1?.ocrText || null, fields: views.part1.fields, summary: views.part1.summary }
+    doc.part2 = { ocrText: doc.part2?.ocrText || null, fields: views.part2.fields, tables: views.part2.tables, summary: views.part2.summary }
 
     await doc.save()
 
     await Correction.create({
       documentId: doc._id,
-      fieldLabel: fieldLabel || doc.extractedFields[fieldIndex].label,
+      fieldLabel: fieldLabel || priorLabel,
       fieldKey: req.params.fieldKey,
       oldValue: oldValue ?? priorValue,
       newValue: trimmedValue,

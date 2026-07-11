@@ -185,7 +185,7 @@ npm run dev
 
 ## Known MVP Limitations
 
-- Image-based (scanned) PDFs may not extract well - upload as JPG/PNG instead
+- Scanned (image-based) PDFs are auto-detected and rasterized to run through the same OCR pipeline as JPG/PNG uploads
 - Groq API key must be a valid key for `groq-sdk`
 - No authentication - single-user local workflow only
 - MongoDB Atlas requires IP whitelisting (`0.0.0.0/0` for development)

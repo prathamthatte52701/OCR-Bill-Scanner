@@ -74,24 +74,101 @@ function runOCRWorker(imagePath) {
 }
 
 // -- PDF extraction ------------------------------------------------------------
-// Note: only digital PDFs with a text layer are supported; scanned PDFs should
-// be uploaded as JPG/PNG so the image split+OCR pipeline can run.
+// Digital PDFs (real text layer) go through pdf-parse as before. Scanned PDFs
+// (a photographed/printed page with no text layer - just an embedded image)
+// have no text layer to extract, so page 1 is rasterized to a PNG (in its own
+// isolated child process - see renderPdfPageToPng) and run through the exact
+// same image pipeline (4x upscale, Part1/Part2 split, Tesseract) used for
+// JPG/PNG uploads - no separate OCR logic is duplicated.
 
 async function extractFromPDF(buffer) {
   try {
-    const pdfParse = require('pdf-parse')
-    const data = await pdfParse(buffer, { max: 4 })
-    const text = data.text?.trim()
-    if (text && text.length > 80) {
-      console.log(`PDF text layer: ${text.length} chars, ${data.numpages} pages`)
-      const cleaned = cleanOCRText(text)
-      return { part1Text: cleaned, part2Text: cleaned }
+    const { PDFParse } = require('pdf-parse')
+    const parser = new PDFParse({ data: buffer })
+    try {
+      const result = await parser.getText()
+      const text = (result.pages || []).map(p => p.text).join('\n').trim()
+      if (text && text.length > 80) {
+        console.log(`PDF text layer: ${text.length} chars, ${result.total} pages`)
+        const cleaned = cleanOCRText(text)
+        return { part1Text: cleaned, part2Text: cleaned }
+      }
+    } finally {
+      await parser.destroy()
     }
   } catch (err) {
     console.error('pdf-parse error:', err.message)
   }
-  console.warn('PDF has no readable text layer. Upload scanned PDFs as JPG or PNG.')
-  return null
+
+  console.log('PDF has no readable text layer - treating as a scanned PDF, rasterizing page 1 for OCR.')
+  try {
+    const { pngBuffer, numPages } = await renderPdfPageToPng(buffer)
+    const result = await extractFromImage(pngBuffer, 'image/png')
+    if (!result) return null
+
+    // Only page 1 of a scanned PDF is ever rasterized/OCR'd - this app's document
+    // model assumes one bill per upload (every real sample is "Page 1 of 1"), so
+    // this is a deliberate scope limit, not a bug. Surface it when it matters so
+    // it's never a silent data-loss surprise on a genuinely multi-page file.
+    if (numPages > 1) {
+      const warning = `This PDF has ${numPages} pages - only page 1 was read. Upload additional pages separately if needed.`
+      console.warn(warning)
+      return { ...result, ocrWarnings: [warning] }
+    }
+    return result
+  } catch (err) {
+    console.error('Scanned PDF rasterization failed:', err.message)
+    return null
+  }
+}
+
+// Rasterizes page 1 of a PDF to a PNG in an isolated child process (mirrors
+// runOCRWorker's pattern) - pdfjs-dist + native canvas rendering on a malformed
+// or hostile scanned PDF must never be able to crash or hang the main server.
+function renderPdfPageToPng(buffer) {
+  return new Promise((resolve, reject) => {
+    const tmpPdfPath = path.join(os.tmpdir(), `consignor_pdf_${Date.now()}.pdf`)
+    const tmpPngPath = path.join(os.tmpdir(), `consignor_pdf_${Date.now()}.png`)
+    fs.writeFileSync(tmpPdfPath, buffer)
+
+    const cleanup = () => {
+      try { fs.unlinkSync(tmpPdfPath) } catch {}
+      try { fs.unlinkSync(tmpPngPath) } catch {}
+    }
+
+    const workerPath = path.join(__dirname, 'pdf-render-worker.js')
+    const child = spawn(process.execPath, [workerPath, tmpPdfPath, tmpPngPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60000,
+    })
+
+    let stdout = ''
+    child.stdout.on('data', d => { stdout += d.toString() })
+    child.stderr.on('data', () => {})
+
+    child.on('close', () => {
+      try {
+        const lines = stdout.trim().split('\n').filter(Boolean)
+        const parsed = JSON.parse(lines[lines.length - 1])
+        if (parsed.success) {
+          const pngBuffer = fs.readFileSync(tmpPngPath)
+          cleanup()
+          resolve({ pngBuffer, numPages: parsed.numPages || 1 })
+        } else {
+          cleanup()
+          reject(new Error(parsed.error || 'PDF rendering failed'))
+        }
+      } catch (err) {
+        cleanup()
+        reject(new Error('PDF render worker output could not be parsed: ' + err.message))
+      }
+    })
+
+    child.on('error', (err) => {
+      cleanup()
+      reject(err)
+    })
+  })
 }
 
 // -- OCR text cleanup ----------------------------------------------------------

@@ -110,6 +110,12 @@ CONSIGNEE vs CONSIGNOR DISAMBIGUATION - CRITICAL:
 - Everything from the start of the text up to (and not including) the line that introduces "VE Commercial Vehicles" / the Consignor's "Name" row belongs to Consignee. Everything from that point onward belongs to Consignor, until a field label clearly says "Consignee" again.
 - Never let an address fragment, state code, GSTIN, or PAN that belongs to one party end up attached to the other party just because the OCR lines were adjacent or out of order. If you cannot confidently tell which party a fragment belongs to, leave that specific sub-field null rather than attaching it to the wrong party.
 
+ADDRESS BOUNDARY RULE - CRITICAL (prevents cross-party address mixing):
+- On the printed form, "Address" is its own label on one line, and the actual street/city/pincode text appears as UNLABELED lines directly below it - this is why address lines are the easiest to misattach to the wrong party.
+- The Address value for a party is ONLY the text that appears strictly between that party's own "Address" label and the NEXT recognized label for that SAME party (GSTIN No, PAN No, State Code, or the other party's Name/Consignor/Consignee marker) - whichever comes first.
+- Stop collecting address lines the moment you hit any of: "State Code", "GSTIN No", "PAN No", "VECV GSTIN No", "VECV PAN No", "Name", "Invoice No", "PO No." - text after one of these belongs to a different field or the other party, never to the address you were building.
+- Do NOT carry a street/building line (e.g. "87A Industrial Area...", "A. B Road Dewas") into the OTHER party's address just because it appeared near their address lines in the flattened text - each party's address lines sit only under that party's own "Address" label.
+
 REFERENCE VALUES - this document type always has the same Consignor, and the same Consignee company (only branch address/state/GSTIN differ by location). Use these ONLY to sanity-check and correct clearly OCR-garbled values, never to overwrite a value that is already clearly and consistently read as something else in the text:
 - Consignor is always: name "VE Commercial Vehicles Ltd (UNIT - EEC)", address "87A Industrial Area No 3, A. B Road Dewas, 455001", state "Madhya Pradesh", stateCode "23", gstin "23AABCE9378F3ZI", pan "AABCE9378F".
 - Consignee company name is always "OERLIKON BALZERS COATING INDIA" and pan is always "AAACI3916N" regardless of branch; consignee address/state/stateCode/gstin vary by branch and must come from the OCR text, not from this reference.
@@ -132,7 +138,7 @@ const PART2_SYSTEM = `You are a document extraction specialist for Indian compan
 
 You will receive OCR text from the LOWER section of the bill only - this section is a single bordered table titled "UNCODED RGP" listing line items (SR No, Description, HSN/SAC, Basic, Quantity, Amount), followed by a totals footer (Total Basic Amount, CGST, SGST, IGST, Total Amount).
 
-NOTE: The page split is done automatically and its exact cut line varies slightly bill to bill. Sometimes a few header metadata lines (Invoice No, FI Doc, Date, Reason, Request No, IRN No) that normally belong to the section above end up included at the very TOP of this OCR text, above "UNCODED RGP". If you see any of them, extract them too - they are a safety-net capture, not the primary content of this section.
+NOTE: The page split is done automatically and its exact cut line varies slightly bill to bill. Sometimes a few header metadata lines (Invoice No, FI Doc, Date, Reason, PO No, Request No, IRN No) that normally belong to the section above end up included at the very TOP of this OCR text, above "UNCODED RGP". If you see any of them, extract them too - they are a safety-net capture, not the primary content of this section.
 
 Return ONLY valid JSON. No markdown. No explanation. No code fences.
 
@@ -159,6 +165,7 @@ EXACT JSON STRUCTURE TO RETURN:
   "fiDoc": "FI Doc value if present at the top of this text, else null",
   "challanDate": "Date value if present at the top of this text, else null",
   "reason": "Reason value if present at the top of this text, else null",
+  "poNo": "PO No value if present at the top of this text, else null",
   "requestNo": "Request No value if present at the top of this text, else null",
   "irnNo": "IRN No value if present at the top of this text, else null",
   "warnings": []
@@ -477,6 +484,102 @@ function sanitizeLineItems(lineItems, warnings) {
   return kept
 }
 
+function buildSummaryPoints(part1Like, part2Like) {
+  const items = Array.isArray(part2Like.lineItems) ? part2Like.lineItems : []
+  return [
+    `Consignee: ${formatValue(part1Like.consignee?.name)}; Consignor: ${formatValue(part1Like.consignor?.name)}.`,
+    `Invoice No: ${formatValue(part1Like.invoiceNo)}, dated ${formatValue(part1Like.challanDate)}.`,
+    `Line items: ${items.length}.`,
+    `Total Amount: ${formatValue(part2Like.totals?.totalAmount)}.`,
+  ]
+}
+
+// Single place that turns canonical structured data (consignee/consignor/totals/
+// lineItems/header scalars) into every derived view (fields, tables, summaries,
+// part1/part2 breakdowns). Used both right after AI extraction AND after a manual
+// field correction, so a correction regenerates every view from the one updated
+// source instead of leaving stale copies anywhere.
+function assembleDocumentViews(part1Like, part2Like) {
+  return {
+    part1: {
+      fields: buildPart1Fields(part1Like),
+      summary: buildPart1Summary(part1Like),
+    },
+    part2: {
+      fields: buildPart2Fields(part2Like),
+      tables: buildPart2Tables(part2Like),
+      summary: buildPart2Summary(part2Like),
+    },
+    fields: buildCombinedFields(part1Like, part2Like),
+    tables: buildCombinedTables(part1Like, part2Like),
+    fullSummary: buildCombinedSummary(part1Like, part2Like),
+    summaryPoints: buildSummaryPoints(part1Like, part2Like),
+  }
+}
+
+// Maps a field's normalizedKey back to where that value lives in the canonical
+// structured document, so a correction can be written once to the real source
+// (not just patched into a display copy) - single-field/scalar entries below,
+// line-item entries (item_<n>_<column>) are handled separately in applyCorrection.
+const FIELD_KEY_PATH = {
+  invoice_no: ['invoiceNo'],
+  fi_doc: ['fiDoc'],
+  challan_date: ['challanDate'],
+  reason: ['reason'],
+  po_no: ['poNo'],
+  request_no: ['requestNo'],
+  irn_no: ['irnNo'],
+  consignee_code: ['consignee', 'code'],
+  consignee_name: ['consignee', 'name'],
+  consignee_address: ['consignee', 'address'],
+  consignee_state: ['consignee', 'stateName'],
+  consignee_gstin: ['consignee', 'gstin'],
+  consignee_pan: ['consignee', 'pan'],
+  consignor_name: ['consignor', 'name'],
+  consignor_address: ['consignor', 'address'],
+  consignor_state: ['consignor', 'stateName'],
+  consignor_gstin: ['consignor', 'gstin'],
+  consignor_pan: ['consignor', 'pan'],
+  total_basic_amount: ['totals', 'totalBasicAmount'],
+  cgst: ['totals', 'cgst'],
+  sgst: ['totals', 'sgst'],
+  igst: ['totals', 'igst'],
+  total_amount: ['totals', 'totalAmount'],
+}
+
+const ITEM_FIELD_PROP = {
+  sr_no: 'srNo',
+  description: 'description',
+  hsn_sac: 'hsnSac',
+  basic: 'basic',
+  quantity: 'quantity',
+  amount: 'amount',
+}
+
+// Mutates `canonical` in place, writing `value` into the real field the
+// normalizedKey refers to. Returns false if the key isn't a known editable field.
+function applyCorrection(canonical, normalizedKey, value) {
+  const itemMatch = normalizedKey.match(/^item_(\d+)_(.+)$/)
+  if (itemMatch) {
+    const index = parseInt(itemMatch[1], 10) - 1
+    const prop = ITEM_FIELD_PROP[itemMatch[2]]
+    if (!prop || !Array.isArray(canonical.lineItems) || !canonical.lineItems[index]) return false
+    canonical.lineItems[index][prop] = value
+    return true
+  }
+
+  const fieldPath = FIELD_KEY_PATH[normalizedKey]
+  if (!fieldPath) return false
+  if (fieldPath.length === 1) {
+    canonical[fieldPath[0]] = value
+  } else {
+    const [objectKey, prop] = fieldPath
+    if (!canonical[objectKey]) canonical[objectKey] = {}
+    canonical[objectKey][prop] = value
+  }
+  return true
+}
+
 async function analyzeDocument({ part1Text, part2Text }) {
   const [part1Parsed, part2Parsed] = await Promise.all([
     part1Text ? runExtraction(PART1_SYSTEM, part1Text, 'consignee/consignor header') : Promise.resolve({}),
@@ -495,41 +598,28 @@ async function analyzeDocument({ part1Text, part2Text }) {
   // safety-net capture of the same fields when Part 1 didn't find them.
   const pick = (key) => part1Parsed[key] ?? part2Parsed[key] ?? null
 
-  return {
-    documentType: 'Delivery Challan - Consignor/Consignee',
+  const part1Like = {
     consignee: part1Parsed.consignee || null,
     consignor: part1Parsed.consignor || null,
     invoiceNo: pick('invoiceNo'),
     fiDoc: pick('fiDoc'),
     challanDate: pick('challanDate'),
     reason: pick('reason'),
-    poNo: part1Parsed.poNo || null,
+    poNo: pick('poNo'),
     requestNo: pick('requestNo'),
     irnNo: pick('irnNo'),
+  }
+  const part2Like = {
     lineItems: Array.isArray(part2Parsed.lineItems) ? part2Parsed.lineItems : [],
     totals: part2Parsed.totals || null,
+  }
+
+  return {
+    documentType: 'Delivery Challan - Consignor/Consignee',
+    ...part1Like,
+    ...part2Like,
     warnings,
-
-    part1: {
-      fields: buildPart1Fields(part1Parsed),
-      summary: buildPart1Summary(part1Parsed),
-    },
-    part2: {
-      fields: buildPart2Fields(part2Parsed),
-      tables: buildPart2Tables(part2Parsed),
-      summary: buildPart2Summary(part2Parsed),
-    },
-
-    // Combined view - one document, all data together
-    fields: buildCombinedFields(part1Parsed, part2Parsed),
-    tables: buildCombinedTables(part1Parsed, part2Parsed),
-    fullSummary: buildCombinedSummary(part1Parsed, part2Parsed),
-    summaryPoints: [
-      `Consignee: ${formatValue(part1Parsed.consignee?.name)}; Consignor: ${formatValue(part1Parsed.consignor?.name)}.`,
-      `Invoice No: ${formatValue(part1Parsed.invoiceNo)}, dated ${formatValue(part1Parsed.challanDate)}.`,
-      `Line items: ${Array.isArray(part2Parsed.lineItems) ? part2Parsed.lineItems.length : 0}.`,
-      `Total Amount: ${formatValue(part2Parsed.totals?.totalAmount)}.`,
-    ],
+    ...assembleDocumentViews(part1Like, part2Like),
   }
 }
 
@@ -597,4 +687,6 @@ ${ocrText || '(not available)'}`
 module.exports = {
   analyzeDocument,
   answerQuestion,
+  assembleDocumentViews,
+  applyCorrection,
 }
