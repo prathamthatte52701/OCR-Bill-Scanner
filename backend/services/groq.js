@@ -329,22 +329,26 @@ function buildPart2Tables(parsed) {
   const tables = []
   const items = Array.isArray(parsed.lineItems) ? parsed.lineItems : []
 
-  if (items.length) {
-    tables.push({
-      title: 'Line Items',
-      confidence: 'medium',
-      columns: ['SR No', 'Description', 'HSN/SAC', 'Basic', 'Quantity', 'Amount'],
-      rows: items.map(item => ({
-        'SR No': item.srNo || '',
-        Description: item.description || '',
-        'HSN/SAC': item.hsnSac || '',
-        Basic: item.basic || '',
-        Quantity: item.quantity || '',
-        Amount: item.amount || '',
-      })),
-      sourceHint: 'UNCODED RGP line-items table',
-    })
-  }
+  // Always push the Line Items table, even with zero rows - dropping the table
+  // object entirely when OCR/AI couldn't read any row made the Uncoded RGP view
+  // silently fall back to showing only Totals, indistinguishable from a working
+  // extraction that just happened to have no line items. The frontend already
+  // renders an explicit "No rows found." placeholder for an empty table - this
+  // makes a genuine read failure visible instead of invisible.
+  tables.push({
+    title: 'Line Items',
+    confidence: 'medium',
+    columns: ['SR No', 'Description', 'HSN/SAC', 'Basic', 'Quantity', 'Amount'],
+    rows: items.map(item => ({
+      'SR No': item.srNo || '',
+      Description: item.description || '',
+      'HSN/SAC': item.hsnSac || '',
+      Basic: item.basic || '',
+      Quantity: item.quantity || '',
+      Amount: item.amount || '',
+    })),
+    sourceHint: 'UNCODED RGP line-items table',
+  })
 
   // Always show every tax/total row, even when unread - dropping a null CGST/SGST/IGST
   // row silently made the "Taxes" view look like it only ever extracts monetary
@@ -401,12 +405,15 @@ function buildPart2Fields(parsed) {
   const items = Array.isArray(parsed.lineItems) ? parsed.lineItems : []
   items.forEach((item, i) => {
     const n = i + 1
-    addField(fields, `Item ${n} - SR No`, item.srNo, 'id')
-    addField(fields, `Item ${n} - Description`, item.description, 'other')
-    addField(fields, `Item ${n} - HSN/SAC`, item.hsnSac, 'id')
-    addField(fields, `Item ${n} - Basic`, item.basic, 'amount')
-    addField(fields, `Item ${n} - Quantity`, item.quantity, 'other')
-    addField(fields, `Item ${n} - Amount`, item.amount, 'amount')
+    // addFieldAlways (not addField) so a null/missing cell in an existing row
+    // still gets a field entry - otherwise that cell has no Edit button at all,
+    // same fix already applied to Part 1's header fields.
+    addFieldAlways(fields, `Item ${n} - SR No`, item.srNo, 'id')
+    addFieldAlways(fields, `Item ${n} - Description`, item.description, 'other')
+    addFieldAlways(fields, `Item ${n} - HSN/SAC`, item.hsnSac, 'id')
+    addFieldAlways(fields, `Item ${n} - Basic`, item.basic, 'amount')
+    addFieldAlways(fields, `Item ${n} - Quantity`, item.quantity, 'other')
+    addFieldAlways(fields, `Item ${n} - Amount`, item.amount, 'amount')
   })
 
   return fields
@@ -493,6 +500,27 @@ function sanitizeLineItems(lineItems, warnings) {
     kept.push(item)
   }
   return kept
+}
+
+// On this template every row in a single UNCODED RGP table shares the same
+// HSN/SAC code (e.g. all rows "998729") - when OCR reads it on some rows but
+// misses it on others in the SAME document, fill the gaps with that one value
+// instead of leaving them null. Only acts when every row that DID read an
+// HSN/SAC agrees on the same value - if two different codes appear, that's
+// evidence this document doesn't follow the single-code assumption, so leave
+// the missing ones alone rather than guessing which one applies.
+function applyHsnSacFallback(items, warnings) {
+  if (!Array.isArray(items) || items.length < 2) return items
+
+  const distinctCodes = new Set(items.map(i => i.hsnSac).filter(Boolean))
+  if (distinctCodes.size !== 1) return items
+
+  const [commonCode] = distinctCodes
+  const missingCount = items.filter(i => !i.hsnSac).length
+  if (missingCount === 0) return items
+
+  warnings.push(`HSN/SAC filled as "${commonCode}" for ${missingCount} row(s) that were missing it, based on every other row in this table sharing that same code (deterministic rule).`)
+  return items.map(item => item.hsnSac ? item : { ...item, hsnSac: commonCode })
 }
 
 function buildSummaryPoints(part1Like, part2Like) {
@@ -680,7 +708,7 @@ async function analyzeDocument({ part1Text, part2Text }) {
     ...(Array.isArray(part2Parsed.warnings) ? part2Parsed.warnings : []),
   ]
 
-  part2Parsed.lineItems = sanitizeLineItems(part2Parsed.lineItems, warnings)
+  part2Parsed.lineItems = applyHsnSacFallback(sanitizeLineItems(part2Parsed.lineItems, warnings), warnings)
 
   // Header metadata usually comes from Part 1, but the automatic page split can
   // occasionally place a line or two on the Part 2 side - fall back to Part 2's

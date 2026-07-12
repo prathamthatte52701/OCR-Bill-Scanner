@@ -91,7 +91,15 @@ async function extractFromPDF(buffer) {
       if (text && text.length > 80) {
         console.log(`PDF text layer: ${text.length} chars, ${result.total} pages`)
         const cleaned = cleanOCRText(text)
-        return { part1Text: cleaned, part2Text: cleaned }
+        // part1Text stays exactly this pdf-parse output, unchanged - Part 1 is
+        // working well off it and must not be touched. part2Text separately
+        // tries a position-reconstructed version of the SAME page (see below) -
+        // pdf-parse returns text in PDF content-stream order, not visual reading
+        // order, which breaks label/value and row adjacency for the line-items
+        // table specifically. If reconstruction fails for any reason, part2Text
+        // falls back to this same `cleaned` text - never worse than before.
+        const part2Reconstructed = await reconstructTextByPosition(buffer)
+        return { part1Text: cleaned, part2Text: part2Reconstructed || cleaned }
       }
     } finally {
       await parser.destroy()
@@ -118,6 +126,57 @@ async function extractFromPDF(buffer) {
     return result
   } catch (err) {
     console.error('Scanned PDF rasterization failed:', err.message)
+    return null
+  }
+}
+
+// Part 2 ONLY - rebuilds page-1 text using each text item's actual x/y position
+// instead of pdf-parse's content-stream order, so a row's cells and a table's
+// row-to-row order come out in real visual (top-to-bottom, left-to-right) order.
+// Part 1 never calls this and is unaffected either way; on any failure this
+// returns null and the caller falls back to the same `cleaned` text Part 1 uses,
+// so this can only ever match or improve Part 2, never make it worse.
+async function reconstructTextByPosition(buffer) {
+  try {
+    const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const path = require('path')
+    const { pathToFileURL } = require('url')
+    const standardFontDataUrl = pathToFileURL(
+      path.join(path.dirname(require.resolve('pdfjs-dist/package.json')), 'standard_fonts') + path.sep
+    ).href
+
+    const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer), standardFontDataUrl, disableWorker: true }).promise
+    const page = await doc.getPage(1)
+    const content = await page.getTextContent()
+
+    const items = content.items
+      .map(it => ({ str: it.str, x: it.transform[4], y: it.transform[5] }))
+      .filter(it => it.str && it.str.trim())
+    if (!items.length) return null
+
+    // Group into visual rows: items within a small y-tolerance of each other
+    // belong to the same printed line, regardless of the order pdfjs returned
+    // them in. Tolerance is small relative to typical font size on this template.
+    const Y_TOLERANCE = 3
+    const rows = []
+    for (const item of items) {
+      let row = rows.find(r => Math.abs(r.y - item.y) <= Y_TOLERANCE)
+      if (!row) {
+        row = { y: item.y, items: [] }
+        rows.push(row)
+      }
+      row.items.push(item)
+    }
+
+    // PDF y-axis increases upward, so sort rows top-to-bottom by descending y;
+    // within a row, sort left-to-right by x - this is the actual visual order.
+    rows.sort((a, b) => b.y - a.y)
+    rows.forEach(r => r.items.sort((a, b) => a.x - b.x))
+
+    const text = rows.map(r => r.items.map(i => i.str).join(' ')).join('\n').trim()
+    return text ? cleanOCRText(text) : null
+  } catch (err) {
+    console.error('Position-based PDF text reconstruction failed (Part 2 only, falling back):', err.message)
     return null
   }
 }

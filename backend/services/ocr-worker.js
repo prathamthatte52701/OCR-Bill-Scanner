@@ -152,7 +152,49 @@ async function run() {
       }
 
       const winner = candidates.reduce((a, b) => scoreResult(a.result) > scoreResult(b.result) ? a : b)
-      return { text: cleanOCRText(winner.result.text), strategy: winner.label }
+      // confidence is additive info only - existing callers destructure just
+      // .text/.strategy today and are unaffected by this extra field being present.
+      return { text: cleanOCRText(winner.result.text), strategy: winner.label, confidence: winner.result.confidence }
+    }
+
+    // Part 2 ONLY, and only ever called AFTER the Part 1/Part 2 split decision
+    // below has already fully resolved - this never participates in choosing
+    // splitY, never participates in the looksLikeTable fallback-recrop decision,
+    // and never touches Part 1's crop or candidates in any way. It just tries a
+    // few extra preprocessing variants on whichever Part 2 crop was already
+    // finalized, purely to see if any of them reads the line-items table better.
+    // The line-items crop has finer print packed into 6-7 columns plus
+    // handwritten annotations overlapping printed text, unlike the header crop -
+    // characteristics never covered by the earlier whole-page 2x/3x/4x
+    // confidence testing. Selection is still the same scoreResult() max-pick as
+    // everywhere else, so this can only match or improve on the existing part2Ocr
+    // result, never replace it with something worse.
+    async function improvePart2Result(currentPart2Ocr, gray) {
+      // currentPart2Ocr.text is already cleanOCRText'd and its real measured
+      // confidence was carried through from ocrPart - reuse both as-is so this
+      // candidate competes on equal footing with the new ones below.
+      const candidates = [{ result: { text: currentPart2Ocr.text, confidence: currentPart2Ocr.confidence || 0 }, label: currentPart2Ocr.strategy }]
+
+      try {
+        const sharpened = await sharp(gray).sharpen({ sigma: 1.5 }).toBuffer()
+        const rs = await recognize(worker, sharpened, 6)
+        candidates.push({ result: { text: cleanOCRText(rs.text?.trim() || ''), confidence: rs.confidence || 0 }, label: 'part2-sharpened-psm6' })
+      } catch { /* sharp/recognize failure on this candidate - skip it, never fatal */ }
+
+      try {
+        const contrastBin = await sharp(gray).linear(1.4, -30).threshold(150).toBuffer()
+        const rc = await recognize(worker, contrastBin, 6)
+        candidates.push({ result: { text: cleanOCRText(rc.text?.trim() || ''), confidence: rc.confidence || 0 }, label: 'part2-contrast-psm6' })
+      } catch { /* same - skip on failure */ }
+
+      try {
+        const rPsm4 = await recognize(worker, gray, 4)
+        candidates.push({ result: { text: cleanOCRText(rPsm4.text?.trim() || ''), confidence: rPsm4.confidence || 0 }, label: 'part2-gray-psm4' })
+      } catch { /* same - skip on failure */ }
+
+      const winner = candidates.reduce((a, b) => scoreResult(b.result) > scoreResult(a.result) ? b : a)
+      if (winner.label === currentPart2Ocr.strategy) return currentPart2Ocr
+      return { text: winner.result.text, strategy: winner.label, confidence: winner.result.confidence }
     }
 
     // Verify part2 actually contains ITEM ROWS, not just the totals footer - if not,
@@ -163,6 +205,7 @@ async function run() {
     // that as concrete evidence at least one row was actually captured.
     let part1Ocr = await ocrPart(part1Crops, 'part1')
     let part2Ocr = await ocrPart(part2Crops, 'part2')
+    let part2GrayUsed = part2Crops.gray
 
     const looksLikeTable = /\b\d{6}\b/.test(part2Ocr.text) && /SR\s*NO|DESCRIPTION|HSN|QUANTITY/i.test(part2Ocr.text)
     if (!looksLikeTable) {
@@ -171,10 +214,15 @@ async function run() {
       const retryOcr = await ocrPart(fallbackPart2Crops, 'part2-fallback')
       if (/SR\s*NO|DESCRIPTION|HSN|AMOUNT|QUANTITY/i.test(retryOcr.text)) {
         part2Ocr = retryOcr
+        part2GrayUsed = fallbackPart2Crops.gray
         const fallbackPart1Crops = await cropBoth(0, fallbackY)
         part1Ocr = await ocrPart(fallbackPart1Crops, 'part1-fallback')
       }
     }
+
+    // Part 1's crop and the split/fallback decision above are fully settled by
+    // this point and are never revisited - this call can only change part2Ocr.
+    part2Ocr = await improvePart2Result(part2Ocr, part2GrayUsed)
 
     process.stdout.write(JSON.stringify({
       part1Text: part1Ocr.text && part1Ocr.text.length > 10 ? part1Ocr.text : null,
