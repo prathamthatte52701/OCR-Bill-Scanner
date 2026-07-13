@@ -22,7 +22,7 @@ async function drainQueue() {
 const Document = require('../models/Document')
 const Correction = require('../models/Correction')
 const { uploadBuffer, downloadBuffer, deleteFile } = require('../services/gridfs')
-const { extractParts } = require('../services/ocr')
+const { extractParts, extractSingleImagePart } = require('../services/ocr')
 const { analyzeDocument, assembleDocumentViews, applyCorrection } = require('../services/groq')
 
 const storage = multer.memoryStorage()
@@ -47,6 +47,36 @@ function uploadMiddleware(req, res, next) {
         return res.status(400).json({ error: 'File size must be 5 MB or less.' })
       }
       return res.status(400).json({ error: err.field || 'Only JPG, JPEG, PNG, and PDF files are allowed.' })
+    }
+    return res.status(400).json({ error: err.message || 'Upload failed.' })
+  })
+}
+
+// Two-image upload flow - Part 1 (header) and Part 2 (line-items) uploaded
+// separately, already manually cropped by the user. Images only (no PDF) -
+// this flow is for photographed/scanned bills, matching how a user would crop
+// a photo into two pieces.
+const uploadPartsStorage = multer.memoryStorage()
+const uploadParts = multer({
+  storage: uploadPartsStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    const allowed = ['image/jpeg', 'image/jpg', 'image/png']
+    if (!allowed.includes(file.mimetype)) {
+      return cb(new multer.MulterError('LIMIT_UNEXPECTED_FILE', 'Only JPG, JPEG, and PNG files are allowed for Part 1/Part 2 uploads.'))
+    }
+    cb(null, true)
+  },
+})
+
+function uploadPartsMiddleware(req, res, next) {
+  uploadParts.fields([{ name: 'part1Image', maxCount: 1 }, { name: 'part2Image', maxCount: 1 }])(req, res, (err) => {
+    if (!err) return next()
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Each file must be 5 MB or less.' })
+      }
+      return res.status(400).json({ error: err.field || 'Only JPG, JPEG, and PNG files are allowed.' })
     }
     return res.status(400).json({ error: err.message || 'Upload failed.' })
   })
@@ -139,6 +169,124 @@ router.post('/upload', uploadMiddleware, async (req, res) => {
   }
 })
 
+// POST /api/documents/upload-parts - two-image flow (Part 1 + Part 2 uploaded
+// separately, already manually cropped). Runs the same extraction pipeline as
+// the single-image flow (extractSingleImagePart -> analyzeDocument), just with
+// no auto-split step since there's nothing to split.
+router.post('/upload-parts', uploadPartsMiddleware, async (req, res) => {
+  try {
+    const part1File = req.files?.part1Image?.[0]
+    const part2File = req.files?.part2Image?.[0]
+    if (!part1File || !part2File) {
+      return res.status(400).json({ error: 'Both Part 1 and Part 2 images are required.' })
+    }
+
+    for (const file of [part1File, part2File]) {
+      const detected = detectMimeType(file.buffer)
+      if (!mimeMatchesUpload(file.mimetype, detected)) {
+        return res.status(400).json({ error: 'File content does not match the selected file type.' })
+      }
+    }
+
+    const autoName = nameFromOriginalFilename(part1File.originalname)
+    const [part1FileId, part2FileId] = await Promise.all([
+      uploadBuffer(part1File.buffer, part1File.originalname, part1File.mimetype),
+      uploadBuffer(part2File.buffer, part2File.originalname, part2File.mimetype),
+    ])
+
+    const doc = await Document.create({
+      autoName,
+      originalFilename: part1File.originalname,
+      mimeType: part1File.mimetype,
+      size: part1File.size + part2File.size,
+      part1FileId,
+      part1OriginalFilename: part1File.originalname,
+      part2FileId,
+      part2OriginalFilename: part2File.originalname,
+      uploadStatus: 'uploaded',
+    })
+
+    enqueue(() => processDocumentTwoImages(doc._id, part1File.buffer, part1File.mimetype, part2File.buffer, part2File.mimetype)).catch(err => {
+      console.error('Background processing error:', err.message)
+    })
+
+    res.status(201).json({ document: doc })
+  } catch (err) {
+    console.error('Upload-parts error:', err)
+    res.status(500).json({ error: 'Something went wrong while processing this document.' })
+  }
+})
+
+async function processDocumentTwoImages(docId, part1Buffer, part1MimeType, part2Buffer, part2MimeType) {
+  try {
+    const [part1Result, part2Result] = await Promise.all([
+      extractSingleImagePart(part1Buffer, part1MimeType, 'part1'),
+      extractSingleImagePart(part2Buffer, part2MimeType, 'part2'),
+    ])
+
+    const ocrParts = {
+      part1Text: part1Result?.part1Text || null,
+      part2Text: part2Result?.part2Text || null,
+    }
+
+    if (!ocrParts.part1Text?.trim() && !ocrParts.part2Text?.trim()) {
+      await updateActiveDocument(docId, {
+        uploadStatus: 'failed',
+        processingError: 'We could not read either image. Please check the crops and try again.',
+      })
+      return
+    }
+
+    let groqResult
+    try {
+      groqResult = await analyzeDocument(ocrParts)
+    } catch (err) {
+      console.error('AI extraction error:', err.message)
+      await updateActiveDocument(docId, {
+        uploadStatus: 'failed',
+        part1OcrTextHidden: ocrParts.part1Text || null,
+        part2OcrTextHidden: ocrParts.part2Text || null,
+        processingError: 'AI analysis is unavailable. Please check the Groq API key or try again later.',
+      })
+      return
+    }
+
+    await updateActiveDocument(docId, {
+      uploadStatus: 'processed',
+      part1OcrTextHidden: ocrParts.part1Text || null,
+      part2OcrTextHidden: ocrParts.part2Text || null,
+      documentType: groqResult.documentType || 'Unknown',
+      fullSummary: groqResult.fullSummary || null,
+      summaryPoints: groqResult.summaryPoints || [],
+      extractedFields: groqResult.fields || [],
+      extractedTables: groqResult.tables || [],
+      invoiceNo: groqResult.invoiceNo || null,
+      fiDoc: groqResult.fiDoc || null,
+      challanDate: groqResult.challanDate || null,
+      reason: groqResult.reason || null,
+      poNo: groqResult.poNo || null,
+      requestNo: groqResult.requestNo || null,
+      irnNo: groqResult.irnNo || null,
+      consignee: groqResult.consignee || null,
+      consignor: groqResult.consignor || null,
+      lineItems: groqResult.lineItems || [],
+      totals: groqResult.totals || null,
+      part1: groqResult.part1 ? { ocrText: ocrParts.part1Text || null, ...groqResult.part1 } : null,
+      part2: groqResult.part2 ? { ocrText: ocrParts.part2Text || null, ...groqResult.part2 } : null,
+      warnings: groqResult.warnings || [],
+      extractionWarnings: groqResult.warnings || [],
+      processingError: null,
+      processedAt: new Date(),
+    })
+  } catch (err) {
+    console.error('processDocumentTwoImages error:', err.message)
+    await updateActiveDocument(docId, {
+      uploadStatus: 'failed',
+      processingError: 'Something went wrong while processing this document.',
+    })
+  }
+}
+
 async function processDocument(docId, buffer, mimeType) {
   try {
     const ocrParts = await extractParts(buffer, mimeType)
@@ -209,7 +357,7 @@ async function processDocument(docId, buffer, mimeType) {
 
 async function recoverInterruptedUploads() {
   const docs = await Document.find({ uploadStatus: 'uploaded', isDeleted: { $ne: true } })
-    .select('_id mimeType gridFsFileId')
+    .select('_id mimeType gridFsFileId part1FileId part2FileId')
 
   docs.forEach((doc) => {
     enqueue(async () => {
@@ -218,12 +366,20 @@ async function recoverInterruptedUploads() {
           _id: doc._id,
           uploadStatus: 'uploaded',
           isDeleted: { $ne: true },
-        }).select('_id mimeType gridFsFileId')
+        }).select('_id mimeType gridFsFileId part1FileId part2FileId')
 
         if (!activeDoc) return
 
-        const buffer = await downloadBuffer(activeDoc.gridFsFileId)
-        await processDocument(activeDoc._id, buffer, activeDoc.mimeType)
+        if (activeDoc.part1FileId) {
+          const [part1Buffer, part2Buffer] = await Promise.all([
+            downloadBuffer(activeDoc.part1FileId),
+            downloadBuffer(activeDoc.part2FileId),
+          ])
+          await processDocumentTwoImages(activeDoc._id, part1Buffer, activeDoc.mimeType, part2Buffer, activeDoc.mimeType)
+        } else {
+          const buffer = await downloadBuffer(activeDoc.gridFsFileId)
+          await processDocument(activeDoc._id, buffer, activeDoc.mimeType)
+        }
       } catch (err) {
         console.error(`Recovery failed for document ${doc._id}:`, err.message)
         await updateActiveDocument(doc._id, {
@@ -324,15 +480,39 @@ router.get('/:id', async (req, res) => {
   }
 })
 
-// GET /api/documents/:id/download
+// GET /api/documents/:id/download - single-image/PDF flow only
 router.get('/:id/download', async (req, res) => {
   try {
     const doc = await Document.findOne({ _id: req.params.id, isDeleted: { $ne: true } })
     if (!doc) return res.status(404).json({ error: 'Document not found.' })
+    if (!doc.gridFsFileId) return res.status(400).json({ error: 'This document was uploaded as two parts - use /download/part1 or /download/part2.' })
 
     const buffer = await downloadBuffer(doc.gridFsFileId)
     res.set('Content-Type', doc.mimeType)
     res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.originalFilename)}"`)
+    res.send(buffer)
+  } catch (err) {
+    console.error('Download error:', err)
+    res.status(500).json({ error: 'Failed to download file.' })
+  }
+})
+
+// GET /api/documents/:id/download/:part - two-image flow, part = 'part1' | 'part2'
+router.get('/:id/download/:part', async (req, res) => {
+  try {
+    const { part } = req.params
+    if (part !== 'part1' && part !== 'part2') return res.status(400).json({ error: 'Invalid part.' })
+
+    const doc = await Document.findOne({ _id: req.params.id, isDeleted: { $ne: true } })
+    if (!doc) return res.status(404).json({ error: 'Document not found.' })
+
+    const fileId = part === 'part1' ? doc.part1FileId : doc.part2FileId
+    const originalFilename = part === 'part1' ? doc.part1OriginalFilename : doc.part2OriginalFilename
+    if (!fileId) return res.status(400).json({ error: 'This document does not have separate Part 1/Part 2 files.' })
+
+    const buffer = await downloadBuffer(fileId)
+    res.set('Content-Type', doc.mimeType)
+    res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(originalFilename || `${part}.jpg`)}"`)
     res.send(buffer)
   } catch (err) {
     console.error('Download error:', err)
@@ -346,7 +526,17 @@ router.post('/:id/reprocess', async (req, res) => {
     const doc = await Document.findOne({ _id: req.params.id, isDeleted: { $ne: true } })
     if (!doc) return res.status(404).json({ error: 'Document not found.' })
 
-    const buffer = await downloadBuffer(doc.gridFsFileId)
+    const isTwoImageDoc = !!doc.part1FileId
+
+    let buffer, part1Buffer, part2Buffer
+    if (isTwoImageDoc) {
+      [part1Buffer, part2Buffer] = await Promise.all([
+        downloadBuffer(doc.part1FileId),
+        downloadBuffer(doc.part2FileId),
+      ])
+    } else {
+      buffer = await downloadBuffer(doc.gridFsFileId)
+    }
 
     await Document.findByIdAndUpdate(doc._id, {
       uploadStatus: 'uploaded',
@@ -372,7 +562,10 @@ router.post('/:id/reprocess', async (req, res) => {
     })
 
     // Queue reprocessing - only 1 OCR job runs at a time to prevent OOM
-    enqueue(() => processDocument(doc._id, buffer, doc.mimeType))
+    const reprocessPromise = isTwoImageDoc
+      ? enqueue(() => processDocumentTwoImages(doc._id, part1Buffer, doc.mimeType, part2Buffer, doc.mimeType))
+      : enqueue(() => processDocument(doc._id, buffer, doc.mimeType))
+    reprocessPromise
       .then(() => updateActiveDocument(doc._id, { reprocessedAt: new Date() }))
       .catch(err => console.error('Reprocess background error:', err.message))
 
@@ -396,6 +589,14 @@ router.delete('/:id', async (req, res) => {
     if (doc.gridFsFileId) {
       try {
         await deleteFile(doc.gridFsFileId)
+      } catch (err) {
+        console.warn(`Failed to delete GridFS file for document ${doc._id}: ${err.message}`)
+      }
+    }
+    for (const fileId of [doc.part1FileId, doc.part2FileId]) {
+      if (!fileId) continue
+      try {
+        await deleteFile(fileId)
       } catch (err) {
         console.warn(`Failed to delete GridFS file for document ${doc._id}: ${err.message}`)
       }

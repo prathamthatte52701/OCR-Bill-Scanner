@@ -104,6 +104,11 @@ export default function DocumentDetailPage() {
   }
 
   function handleDownload() {
+    if (doc?.part1FileId) {
+      window.open(`/api/documents/${id}/download/part1`, '_blank')
+      window.open(`/api/documents/${id}/download/part2`, '_blank')
+      return
+    }
     window.open(`/api/documents/${id}/download`, '_blank')
   }
 

@@ -86,45 +86,6 @@ function DocumentIcon() {
   )
 }
 
-function DocumentContextPanel({ doc }) {
-  return (
-    <aside className="flex min-h-0 flex-col rounded-2xl border border-blue-300/15 bg-slate-950/58 p-4 shadow-[0_24px_90px_rgba(2,8,23,0.34)] backdrop-blur-xl">
-      <PanelTitle icon="DC">Document Context</PanelTitle>
-
-      <div className="rounded-2xl border border-blue-300/14 bg-slate-900/46 p-4">
-        <div className="flex items-start gap-3">
-          <DocumentIcon />
-          <div className="min-w-0">
-            <h2 className="truncate text-base font-black text-white">{doc.autoName}</h2>
-            <p className="mt-1 overflow-hidden text-ellipsis text-[14.7px] text-blue-100/70">{doc.documentType || 'Delivery Challan'} Chat</p>
-          </div>
-        </div>
-
-        <div className="mt-5">
-          <StatusBadge status={doc.uploadStatus} />
-        </div>
-
-        <div className="my-5 h-px bg-gradient-to-r from-transparent via-slate-600/60 to-transparent" />
-
-        <div className="space-y-4">
-          <MetaRow icon="ID" label="Uploaded by" value="Business Owner" />
-          <MetaRow icon="ON" label="Uploaded on" value={formatDateTime(doc.createdAt)} />
-          <MetaRow icon="TY" label="File type" value={getFileType(doc.mimeType)} />
-          <MetaRow icon="PG" label="Pages" value={doc.pageCount || doc.pages || 1} />
-          <MetaRow icon="LN" label="Language" value="English" />
-        </div>
-      </div>
-
-      <div className="mt-auto hidden rounded-2xl border border-blue-300/12 bg-blue-500/[0.045] p-4 text-[14.7px] text-slate-400 lg:block">
-        <div className="flex items-start gap-3">
-          <MiniIcon>AI</MiniIcon>
-          <p>AI responses are generated from the uploaded document content.</p>
-        </div>
-      </div>
-    </aside>
-  )
-}
-
 function InsightRow({ label, value }) {
   return (
     <div className="border-b border-white/8 py-3 last:border-b-0">
@@ -134,7 +95,11 @@ function InsightRow({ label, value }) {
   )
 }
 
-function QuickInsightsPanel({ doc }) {
+// Document Context + Quick Insights stacked together in one left sidebar
+// (instead of opposite sides of the screen) so the chat panel in the middle
+// can take up most of the width - important once chat responses start
+// including wide tables (Uncoded RGP, Taxes).
+function SidebarPanel({ doc }) {
   const consignee = firstValue(doc.consignee?.name)
   const consignor = firstValue(doc.consignor?.name)
   const invoiceNo = firstValue(doc.invoiceNo)
@@ -142,6 +107,33 @@ function QuickInsightsPanel({ doc }) {
 
   return (
     <aside className="flex min-h-0 flex-col gap-4 overflow-y-auto rounded-2xl border border-blue-300/15 bg-slate-950/58 p-4 shadow-[0_24px_90px_rgba(2,8,23,0.34)] backdrop-blur-xl">
+      <section>
+        <PanelTitle icon="DC">Document Context</PanelTitle>
+        <div className="rounded-2xl border border-blue-300/14 bg-slate-900/46 p-4">
+          <div className="flex items-start gap-3">
+            <DocumentIcon />
+            <div className="min-w-0">
+              <h2 className="truncate text-base font-black text-white">{doc.autoName}</h2>
+              <p className="mt-1 overflow-hidden text-ellipsis text-[14.7px] text-blue-100/70">{doc.documentType || 'Delivery Challan'} Chat</p>
+            </div>
+          </div>
+
+          <div className="mt-5">
+            <StatusBadge status={doc.uploadStatus} />
+          </div>
+
+          <div className="my-5 h-px bg-gradient-to-r from-transparent via-slate-600/60 to-transparent" />
+
+          <div className="space-y-4">
+            <MetaRow icon="ID" label="Uploaded by" value="Business Owner" />
+            <MetaRow icon="ON" label="Uploaded on" value={formatDateTime(doc.createdAt)} />
+            <MetaRow icon="TY" label="File type" value={getFileType(doc.mimeType)} />
+            <MetaRow icon="PG" label="Pages" value={doc.pageCount || doc.pages || 1} />
+            <MetaRow icon="LN" label="Language" value="English" />
+          </div>
+        </div>
+      </section>
+
       <section>
         <PanelTitle icon="IN">Quick Insights</PanelTitle>
         <div className="rounded-2xl border border-blue-300/14 bg-slate-900/46 p-4">
@@ -165,7 +157,14 @@ function QuickInsightsPanel({ doc }) {
       <div className="rounded-2xl border border-blue-300/12 bg-blue-500/[0.045] p-4 text-[14.7px] text-slate-400">
         <div className="flex items-start gap-3">
           <MiniIcon>TP</MiniIcon>
-          <p><span className="font-semibold text-slate-300">Tip:</span> Use the buttons below the chat for Full Summary, About, Consignee Details, Consigner Details, and Items &amp; Tax - or ask anything about this document directly.</p>
+          <p><span className="font-semibold text-slate-300">Tip:</span> Use the buttons below the chat for Full Summary, Consignee Details, Consigner Details, Uncoded RGP, and Taxes - or ask anything about this document directly.</p>
+        </div>
+      </div>
+
+      <div className="mt-auto rounded-2xl border border-blue-300/12 bg-blue-500/[0.045] p-4 text-[14.7px] text-slate-400">
+        <div className="flex items-start gap-3">
+          <MiniIcon>AI</MiniIcon>
+          <p>AI responses are generated from the uploaded document content.</p>
         </div>
       </div>
     </aside>
@@ -177,8 +176,8 @@ function PageLoadingState() {
     <div className="min-h-[calc(100vh-104px)] bg-[#020817] px-4 py-6">
       <div className="mx-auto max-w-[1540px] rounded-2xl border border-blue-300/12 bg-slate-950/58 p-6">
         <div className="h-5 w-44 rounded-full bg-slate-800/80" />
-        <div className="mt-6 grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)_320px]">
-          {[0, 1, 2].map(item => (
+        <div className="mt-6 grid gap-5 xl:grid-cols-[320px_minmax(0,1fr)]">
+          {[0, 1].map(item => (
             <div key={item} className="h-[520px] animate-pulse rounded-2xl border border-blue-300/10 bg-slate-900/50" />
           ))}
         </div>
@@ -309,8 +308,8 @@ export default function DocumentChatPage() {
       <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(59,130,246,0.055)_1px,transparent_1px),linear-gradient(90deg,rgba(59,130,246,0.055)_1px,transparent_1px)] bg-[size:42px_42px] opacity-35" />
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_30%_0%,rgba(37,99,235,0.18),transparent_30%),radial-gradient(circle_at_82%_15%,rgba(14,165,233,0.12),transparent_28%)]" />
 
-      <div className="relative mx-auto grid max-w-[1540px] gap-4 xl:h-[calc(100vh-104px)] xl:grid-cols-[320px_minmax(0,1fr)_320px] 2xl:grid-cols-[340px_minmax(0,1fr)_340px]">
-        <DocumentContextPanel doc={doc} />
+      <div className="relative mx-auto grid max-w-[1920px] gap-4 xl:h-[calc(100vh-104px)] xl:grid-cols-[320px_minmax(0,1fr)] 2xl:grid-cols-[340px_minmax(0,1fr)]">
+        <SidebarPanel doc={doc} />
 
         <section className="flex min-h-[680px] min-w-0 flex-col overflow-hidden rounded-2xl border border-blue-300/15 bg-slate-950/64 shadow-[0_24px_90px_rgba(2,8,23,0.34)] backdrop-blur-xl xl:min-h-0">
           <header className="border-b border-blue-300/12 px-4 py-4 sm:px-5">
@@ -381,8 +380,6 @@ export default function DocumentChatPage() {
             </div>
           )}
         </section>
-
-        <QuickInsightsPanel doc={doc} />
       </div>
 
       {correctionField && (

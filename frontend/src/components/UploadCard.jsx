@@ -1,17 +1,22 @@
 import { useRef, useState } from 'react'
 
 const ACCEPTED_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf']
+const IMAGE_ONLY_TYPES = ['image/jpeg', 'image/jpg', 'image/png']
 const MAX_SIZE_MB = 5
 const documentTypes = ['Delivery Challan', 'Consignor/Consignee Bill', 'Rule 55 CGST Challan']
 
-export default function UploadCard({ onFileSelect, disabled }) {
+// `compact` + `label` render a smaller box for the two-image (Part 1/Part 2)
+// upload flow; `imageOnly` restricts to JPG/PNG (no PDF) for that same flow,
+// since a manually-cropped section is always a photo, never a PDF page.
+export default function UploadCard({ onFileSelect, disabled, compact = false, label = null, imageOnly = false, selectedFile = null }) {
   const inputRef = useRef(null)
   const [dragOver, setDragOver] = useState(false)
   const [error, setError] = useState('')
+  const acceptedTypes = imageOnly ? IMAGE_ONLY_TYPES : ACCEPTED_TYPES
 
   function validateFile(file) {
-    if (!ACCEPTED_TYPES.includes(file.type)) {
-      return 'Only JPG, JPEG, PNG, and PDF files are allowed.'
+    if (!acceptedTypes.includes(file.type)) {
+      return imageOnly ? 'Only JPG, JPEG, and PNG files are allowed.' : 'Only JPG, JPEG, PNG, and PDF files are allowed.'
     }
     if (file.size > MAX_SIZE_MB * 1024 * 1024) {
       return `File size must be ${MAX_SIZE_MB} MB or less.`
@@ -42,6 +47,56 @@ export default function UploadCard({ onFileSelect, disabled }) {
     if (file) handleFile(file)
   }
 
+  const acceptAttr = imageOnly ? '.jpg,.jpeg,.png' : '.jpg,.jpeg,.png,.pdf'
+
+  if (compact) {
+    return (
+      <div className="w-full">
+        {label && <p className="mb-2 text-sm font-bold text-blue-300">{label}</p>}
+        <div
+          onClick={() => !disabled && inputRef.current?.click()}
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          className={`group relative min-h-[180px] cursor-pointer overflow-hidden rounded-2xl border border-dashed p-5 text-center transition-all ${
+            disabled
+              ? 'cursor-not-allowed border-slate-700/70 opacity-50'
+              : dragOver
+                ? 'border-cyan-300/80 bg-cyan-400/[0.075]'
+                : selectedFile
+                  ? 'border-emerald-400/50 bg-emerald-400/[0.05]'
+                  : 'border-slate-500/60 bg-slate-950/30 hover:border-blue-300/75 hover:bg-blue-500/[0.045]'
+          }`}
+        >
+          <input
+            ref={inputRef}
+            type="file"
+            accept={acceptAttr}
+            className="hidden"
+            onChange={handleChange}
+            disabled={disabled}
+          />
+          <div className="relative flex min-h-[140px] flex-col items-center justify-center gap-2">
+            <svg className="h-8 w-8 text-blue-200" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+              <path d="M12 16V4" />
+              <path d="M7 9l5-5 5 5" />
+              <path d="M20 16v3a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-3" />
+            </svg>
+            {selectedFile ? (
+              <p className="text-sm font-semibold text-emerald-300 break-all px-2">{selectedFile.name}</p>
+            ) : (
+              <>
+                <p className="text-sm font-semibold text-white">Drop image here</p>
+                <p className="text-xs text-slate-500">or click to browse - JPG/PNG, max 5MB</p>
+              </>
+            )}
+          </div>
+        </div>
+        {error && <p className="mt-2 text-xs text-rose-300">{error}</p>}
+      </div>
+    )
+  }
+
   return (
     <div className="w-full">
       <div
@@ -60,7 +115,7 @@ export default function UploadCard({ onFileSelect, disabled }) {
         <input
           ref={inputRef}
           type="file"
-          accept=".jpg,.jpeg,.png,.pdf"
+          accept={acceptAttr}
           className="hidden"
           onChange={handleChange}
           disabled={disabled}

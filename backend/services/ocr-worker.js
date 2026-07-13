@@ -3,7 +3,11 @@
 // Consignor-Consignee delivery challan: 4x upscale, auto-split into
 // Part 1 (Consignee/Consignor header table) and Part 2 (line-items + tax table)
 
-const [,, imagePath] = process.argv
+// argv[3], if present, is 'part1' or 'part2' - "single-part mode": the caller
+// has already manually cropped this image to just that section, so the whole
+// image IS the crop - no split/findSplitY logic runs at all. Without argv[3],
+// behavior is 100% unchanged from before (auto-split a combined image).
+const [,, imagePath, singlePartMode] = process.argv
 
 async function run() {
   const fs = require('fs')
@@ -117,6 +121,24 @@ async function run() {
     const pageHeight = enhancedMeta.height || 2000
     const pageWidth = enhancedMeta.width || 1500
 
+    // Single-part mode: skip split-anchor detection entirely (nothing to split).
+    // ocrPart and improvePart2Result are function declarations defined further
+    // down in this same block - hoisted, so they're callable here already.
+    if (singlePartMode === 'part1' || singlePartMode === 'part2') {
+      const fullCrop = { bin: enhancedBuffer, gray: grayBuffer }
+      let ocrResult = await ocrPart(fullCrop, singlePartMode)
+      if (singlePartMode === 'part2') {
+        ocrResult = await improvePart2Result(ocrResult, grayBuffer)
+      }
+      const text = ocrResult.text && ocrResult.text.length > 10 ? ocrResult.text : null
+      process.stdout.write(JSON.stringify({
+        part1Text: singlePartMode === 'part1' ? text : null,
+        part2Text: singlePartMode === 'part2' ? text : null,
+        debug: { singlePartMode, strategy: ocrResult.strategy },
+      }) + '\n')
+      return
+    }
+
     const splitY = await findSplitY(worker, grayBuffer, pageHeight)
     const padding = Math.round(pageHeight * 0.01)
     // Part 2's top edge gets extra buffer (vs Part 1's bottom edge) so a slightly
@@ -132,6 +154,21 @@ async function run() {
     const part1Crops = await cropBoth(0, Math.max(1, splitY + padding))
     const part2Top = Math.max(0, splitY - part2TopPadding)
     const part2Crops = await cropBoth(part2Top, pageHeight - part2Top)
+
+    // A bare 6-digit run is NOT enough evidence - this template's footer
+    // boilerplate always has one too (phone numbers like "07292 402611", CIN
+    // fragments), and "UNCODED RGP"/"HSN" etc. are printed as column headers
+    // even when the row data below them got lost, so keyword-anywhere-in-text
+    // + digit-anywhere-in-text (unrelated, non-adjacent matches) still
+    // false-positives. Every real item row on this template carries the HSN/SAC
+    // code "998729" or "998719" specifically - checking for those two known
+    // codes verbatim is unambiguous proof an actual row was captured. Used ONLY
+    // by the Part-2-only last-resort table-band recovery further below - normal
+    // candidate selection (both Part 1 and Part 2) is untouched plain
+    // scoreResult(), exactly as it was before this recovery mechanism existed.
+    function hasTableEvidence(text) {
+      return /\b998(729|719)\b/.test(text)
+    }
 
     async function ocrPart({ bin, gray }, label) {
       const candidates = []
@@ -193,8 +230,51 @@ async function run() {
       } catch { /* same - skip on failure */ }
 
       const winner = candidates.reduce((a, b) => scoreResult(b.result) > scoreResult(a.result) ? b : a)
-      if (winner.label === currentPart2Ocr.strategy) return currentPart2Ocr
-      return { text: winner.result.text, strategy: winner.label, confidence: winner.result.confidence }
+      const best = winner.label === currentPart2Ocr.strategy
+        ? currentPart2Ocr
+        : { text: winner.result.text, strategy: winner.label, confidence: winner.result.confidence }
+
+      // The item table normally sits in the upper half of the Part 2 crop, with
+      // the totals footer, declaration text, stamps, and signatures below it.
+      // Tesseract's PSM 6 (uniform block) layout analysis can get confused by
+      // that mixed table+free-text+stamp layout and skip the table lines
+      // entirely even though they're clearly legible on their own - cropping
+      // down to just the upper table band and re-running OCR on that alone
+      // routinely recovers rows the full-crop pass completely missed. This is
+      // MERGED (prepended) onto the winning text above, never a replacement -
+      // replacing outright would drop the totals footer the winner already has
+      // if the table-band crop happens to score/read "better" on its own.
+      if (!hasTableEvidence(best.text)) {
+        try {
+          const cropMeta = await sharp(gray).metadata()
+          const bandCandidates = []
+          // Tried a wider band (0.55) first and it still lost the table on real
+          // test data - the totals/declaration/stamp block that far down was
+          // still enough to confuse layout analysis. 0.25-0.40 consistently
+          // isolates just the table on real samples; try a couple of ratios
+          // and keep whichever actually shows table evidence.
+          for (const ratio of [0.35, 0.45]) {
+            const h = Math.round((cropMeta.height || 0) * ratio)
+            if (h <= 0) continue
+            const band = await sharp(gray).extract({ left: 0, top: 0, width: cropMeta.width, height: h }).toBuffer()
+            const rt = await recognize(worker, band, 6)
+            bandCandidates.push({ result: { text: cleanOCRText(rt.text?.trim() || ''), confidence: rt.confidence || 0 }, label: `part2-tableband-${ratio}` })
+          }
+          const bandWithEvidence = bandCandidates.filter(c => hasTableEvidence(c.result.text))
+          const bandWinner = bandWithEvidence.length
+            ? bandWithEvidence.reduce((a, b) => scoreResult(b.result) > scoreResult(a.result) ? b : a)
+            : null
+          if (bandWinner) {
+            return {
+              text: `${bandWinner.result.text}\n${best.text}`,
+              strategy: `${best.strategy}+${bandWinner.label}`,
+              confidence: best.confidence,
+            }
+          }
+        } catch { /* table-band recovery failed - fall through to `best` unchanged */ }
+      }
+
+      return best
     }
 
     // Verify part2 actually contains ITEM ROWS, not just the totals footer - if not,

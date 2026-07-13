@@ -3,58 +3,21 @@ import ExtractedFieldsTable from './ExtractedFieldsTable'
 import ExtractedTablesView from './ExtractedTablesView'
 
 const DETAIL_VIEWS = [
-  { id: 'summary', label: 'Full Summary' },
-  { id: 'about', label: 'About' },
+  { id: 'summary1', label: 'Full Summary (Part 1)' },
   { id: 'consignee', label: 'Consignee Details' },
   { id: 'consigner', label: 'Consigner Details' },
+  { id: 'summary2', label: 'Full Summary (Part 2)' },
   { id: 'items', label: 'Uncoded RGP' },
   { id: 'taxes', label: 'Taxes' },
 ]
 
-// Part 1 page: party/header info. Part 2 page: line-items/tax info. "About" and
-// "Full Summary" are shared on both since they're whole-document, not part-specific.
+// Part 1 page: its own full summary plus party/header info. Part 2 page: its
+// own full summary plus line-items/tax info. Each part's summary is generated
+// independently (doc.part1.summary / doc.part2.summary) so it only reflects
+// that part's own extracted data - no combined/whole-document view anymore.
 const PART_VIEW_IDS = {
-  part1: ['summary', 'about', 'consignee', 'consigner'],
-  part2: ['summary', 'about', 'taxes', 'items'],
-}
-
-function formatDateTime(dateStr) {
-  if (!dateStr) return '-'
-  return new Date(dateStr).toLocaleString('en-IN', {
-    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
-}
-
-function formatSize(bytes) {
-  if (!bytes) return '-'
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
-}
-
-function AboutView({ doc }) {
-  const rows = [
-    ['Document Name', doc.autoName],
-    ['Original Filename', doc.originalFilename],
-    ['Document Type', doc.documentType || 'Delivery Challan'],
-    ['File Type', doc.mimeType],
-    ['File Size', formatSize(doc.size)],
-    ['Status', doc.uploadStatus],
-    ['Uploaded On', formatDateTime(doc.createdAt)],
-    ['Processed On', formatDateTime(doc.processedAt || doc.reprocessedAt)],
-  ]
-  return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-      <h3 className="text-gray-300 font-semibold mb-3">About This Document</h3>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {rows.map(([label, value]) => (
-          <div key={label}>
-            <p className="text-gray-600 text-[11.6px] mb-0.5">{label}</p>
-            <p className="text-gray-200 text-[13.6px] break-words">{value || '-'}</p>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
+  part1: ['summary1', 'consignee', 'consigner'],
+  part2: ['summary2', 'taxes', 'items'],
 }
 
 // "Consignee Details" also includes challan-level metadata (Invoice No, FI Doc,
@@ -76,17 +39,26 @@ export function DetailView({ type, doc, onCorrect }) {
   if (!doc) return null
   const fields = doc.extractedFields || []
 
-  if (type === 'summary') {
+  if (type === 'summary1') {
     return (
       <SummaryCard
-        fullSummary={doc.fullSummary}
-        summaryPoints={doc.summaryPoints}
-        fields={fields}
+        fullSummary={doc.part1?.summary}
+        summaryPoints={[]}
+        fields={doc.part1?.fields || fields}
         onCorrect={onCorrect}
       />
     )
   }
-  if (type === 'about') return <AboutView doc={doc} />
+  if (type === 'summary2') {
+    return (
+      <SummaryCard
+        fullSummary={doc.part2?.summary}
+        summaryPoints={[]}
+        fields={doc.part2?.fields || fields}
+        onCorrect={onCorrect}
+      />
+    )
+  }
   if (type === 'consignee') {
     return <ExtractedFieldsTable fields={filterFields(fields, 'consignee_', CONSIGNEE_EXTRA_KEYS)} onCorrect={onCorrect} />
   }

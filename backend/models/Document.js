@@ -51,6 +51,15 @@ const documentSchema = new mongoose.Schema({
   mimeType: { type: String, required: true },
   size: { type: Number, required: true },
   gridFsFileId: { type: mongoose.Schema.Types.ObjectId },
+  // Two-image upload flow: user manually crops and uploads Part 1 (header) and
+  // Part 2 (line-items) separately, instead of one combined-page image. When
+  // set, gridFsFileId above is unused for this document; download endpoints
+  // use these two instead. Null for documents uploaded the older, single-image
+  // way (auto-split), which remains fully supported.
+  part1FileId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  part1OriginalFilename: { type: String, default: null },
+  part2FileId: { type: mongoose.Schema.Types.ObjectId, default: null },
+  part2OriginalFilename: { type: String, default: null },
   uploadStatus: {
     type: String,
     enum: ['uploaded', 'processed', 'failed'],

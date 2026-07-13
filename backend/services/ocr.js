@@ -20,12 +20,12 @@ async function extractParts(buffer, mimeType) {
 
 // -- Run OCR in isolated child process ----------------------------------------
 
-async function extractFromImage(buffer, mimeType = 'image/jpeg') {
+async function extractFromImage(buffer, mimeType = 'image/jpeg', singlePartMode = null) {
   const ext = mimeType === 'image/png' ? 'png' : 'jpg'
   const tmpPath = path.join(os.tmpdir(), `consignor_${Date.now()}.${ext}`)
   fs.writeFileSync(tmpPath, buffer)
   try {
-    const result = await runOCRWorker(tmpPath)
+    const result = await runOCRWorker(tmpPath, singlePartMode)
     console.log(`OCR result: part1=${result?.part1Text?.length || 0} chars, part2=${result?.part2Text?.length || 0} chars`)
     return result
   } finally {
@@ -33,10 +33,21 @@ async function extractFromImage(buffer, mimeType = 'image/jpeg') {
   }
 }
 
-function runOCRWorker(imagePath) {
+// User has already manually cropped this image down to exactly one section
+// (Consignee/Consignor header, or the Uncoded RGP line-items table) - the
+// worker skips auto-split entirely and OCRs the whole image as that one part.
+// This is the two-image upload flow; the combined-image auto-split flow above
+// (extractParts/extractFromImage with no singlePartMode) is untouched.
+async function extractSingleImagePart(buffer, mimeType, partLabel) {
+  const result = await extractFromImage(buffer, mimeType, partLabel)
+  return result
+}
+
+function runOCRWorker(imagePath, singlePartMode = null) {
   return new Promise((resolve) => {
     const workerPath = path.join(__dirname, 'ocr-worker.js')
-    const child = spawn(process.execPath, [workerPath, imagePath], {
+    const args = singlePartMode ? [workerPath, imagePath, singlePartMode] : [workerPath, imagePath]
+    const child = spawn(process.execPath, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 180000,
     })
@@ -52,7 +63,11 @@ function runOCRWorker(imagePath) {
       const lastLine = lines[lines.length - 1]
       try {
         const parsed = JSON.parse(lastLine)
-        if (parsed.debug) console.log(`OCR split debug: splitY=${parsed.debug.splitY}, part1=${parsed.debug.part1Strategy}, part2=${parsed.debug.part2Strategy}`)
+        if (parsed.debug?.singlePartMode) {
+          console.log(`OCR single-part debug: mode=${parsed.debug.singlePartMode}, strategy=${parsed.debug.strategy}`)
+        } else if (parsed.debug) {
+          console.log(`OCR split debug: splitY=${parsed.debug.splitY}, part1=${parsed.debug.part1Strategy}, part2=${parsed.debug.part2Strategy}`)
+        }
         if (parsed.part1Text || parsed.part2Text) {
           resolve({ part1Text: parsed.part1Text || null, part2Text: parsed.part2Text || null })
         } else {
@@ -247,4 +262,4 @@ function cleanOCRText(text) {
     .trim()
 }
 
-module.exports = { extractParts }
+module.exports = { extractParts, extractSingleImagePart }

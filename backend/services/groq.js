@@ -523,6 +523,42 @@ function applyHsnSacFallback(items, warnings) {
   return items.map(item => item.hsnSac ? item : { ...item, hsnSac: commonCode })
 }
 
+function parseAmount(value) {
+  if (value === null || value === undefined) return null
+  const n = parseFloat(String(value).replace(/,/g, ''))
+  return Number.isNaN(n) ? null : n
+}
+
+// On this template every real document is an interstate delivery (Gujarat
+// consignee <-> Madhya Pradesh consignor) - CGST and SGST are always 0.00,
+// only IGST ever carries a real value. When the CGST/SGST/IGST footer is
+// badly garbled, the AI has occasionally attached the one real nonzero
+// number to CGST or SGST instead of IGST. If exactly one of the three has a
+// nonzero value and it isn't IGST, move it to IGST and zero the other two -
+// this only fires when the source data is unambiguous about WHICH number is
+// non-zero, it never invents a value that wasn't actually read.
+function applyTotalsSanityRule(totals, warnings) {
+  if (!totals) return totals
+  const cgst = parseAmount(totals.cgst)
+  const sgst = parseAmount(totals.sgst)
+  const igst = parseAmount(totals.igst)
+
+  const nonZero = [['cgst', cgst], ['sgst', sgst], ['igst', igst]].filter(([, v]) => v !== null && v !== 0)
+  if (nonZero.length !== 1) return totals
+
+  const [field] = nonZero[0]
+  if (field === 'igst') return totals
+
+  const originalValue = totals[field]
+  warnings.push(`${field.toUpperCase()} value "${originalValue}" moved to IGST (deterministic rule: this template is always interstate, so only IGST is ever nonzero).`)
+  return {
+    ...totals,
+    cgst: '0.00',
+    sgst: '0.00',
+    igst: originalValue,
+  }
+}
+
 function buildSummaryPoints(part1Like, part2Like) {
   const items = Array.isArray(part2Like.lineItems) ? part2Like.lineItems : []
   return [
@@ -709,6 +745,7 @@ async function analyzeDocument({ part1Text, part2Text }) {
   ]
 
   part2Parsed.lineItems = applyHsnSacFallback(sanitizeLineItems(part2Parsed.lineItems, warnings), warnings)
+  part2Parsed.totals = applyTotalsSanityRule(part2Parsed.totals, warnings)
 
   // Header metadata usually comes from Part 1, but the automatic page split can
   // occasionally place a line or two on the Part 2 side - fall back to Part 2's
