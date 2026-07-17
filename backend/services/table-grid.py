@@ -78,26 +78,62 @@ def extract_table_cells(image_path, out_json_path):
     hor_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
     ver_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
 
-    row_positions = line_positions(hor_lines, 'row', min_coverage=0.2)
-    col_positions = line_positions(ver_lines, 'col', min_coverage=0.1)
-
     img_h, img_w = img.shape[0], img.shape[1]
+
+    # Isolate the line-items table's own bordered rectangle before scanning for
+    # the row/column grid. Without this, line-detection on the full page also
+    # picks up unrelated bordered boxes lower down (CGST/SGST/IGST totals box,
+    # stamp/signature box, Tel/Fax footer) as if they were extra table rows,
+    # which wrecks short (1-2 row) tables. Fall back to full-image scanning
+    # unchanged if no qualifying rectangle is found (safety net).
+    table_rect = None
+    combined = cv2.bitwise_or(hor_lines, ver_lines)
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    img_area = img_h * img_w
+    candidates = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w * h < img_area * 0.15:
+            continue
+        if h > w:  # table is always wider than tall; reject taller-than-wide boxes
+            continue
+        candidates.append((x, y, w, h))
+    if candidates:
+        # table always starts near the top of the photo, well above the
+        # stamp/footer boxes near the bottom
+        table_rect = min(candidates, key=lambda r: r[1])
+
+    if table_rect:
+        rx, ry, rw, rh = table_rect
+        hor_region = hor_lines[ry:ry + rh, rx:rx + rw]
+        ver_region = ver_lines[ry:ry + rh, rx:rx + rw]
+        row_positions = [p + ry for p in line_positions(hor_region, 'row', min_coverage=0.2)]
+        col_positions = [p + rx for p in line_positions(ver_region, 'col', min_coverage=0.1)]
+    else:
+        row_positions = line_positions(hor_lines, 'row', min_coverage=0.2)
+        col_positions = line_positions(ver_lines, 'col', min_coverage=0.1)
 
     # The table's outermost border lines (left/top and right/bottom) are often
     # faint/absent right at the photo's own edge (lighting falloff, slight
     # crop, or rotation's BORDER_REPLICATE smearing that edge) - if the first/
-    # last detected line isn't already near the image edge, add the edge
-    # itself as the missing boundary so that outer column/row isn't dropped.
+    # last detected line isn't already near the edge, add the edge itself as
+    # the missing boundary so that outer column/row isn't dropped. Bounds are
+    # the isolated table rect's own edges when one was found, else the image.
+    if table_rect:
+        rx, ry, rw, rh = table_rect
+        left_b, right_b, top_b, bottom_b = rx, rx + rw, ry, ry + rh
+    else:
+        left_b, right_b, top_b, bottom_b = 0, img_w, 0, img_h
     if col_positions:
-        if col_positions[0] > img_w * 0.08:
-            col_positions.insert(0, 5)
-        if col_positions[-1] < img_w * 0.92:
-            col_positions.append(img_w - 5)
+        if col_positions[0] > left_b + (right_b - left_b) * 0.08:
+            col_positions.insert(0, left_b + 5)
+        if col_positions[-1] < right_b - (right_b - left_b) * 0.08:
+            col_positions.append(right_b - 5)
     if row_positions:
-        if row_positions[0] > img_h * 0.08:
-            row_positions.insert(0, 5)
-        if row_positions[-1] < img_h * 0.92:
-            row_positions.append(img_h - 5)
+        if row_positions[0] > top_b + (bottom_b - top_b) * 0.08:
+            row_positions.insert(0, top_b + 5)
+        if row_positions[-1] < bottom_b - (bottom_b - top_b) * 0.08:
+            row_positions.append(bottom_b - 5)
 
     print("row_positions:", len(row_positions), "| col_positions:", len(col_positions), file=sys.stderr)
     if len(row_positions) < 3 or len(col_positions) < 3:

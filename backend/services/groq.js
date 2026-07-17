@@ -1187,6 +1187,22 @@ function applyHsnJunkRule(items, warnings) {
   return items.map(item => ({ ...item, hsnSac: normalizeHsnSacJunk(item.hsnSac, warnings, item.srNo) }))
 }
 
+// A column-shift can also land the HSN/SAC code in the Basic cell (grid path
+// mis-detected a column boundary) - a bare 6-digit "99_7__" value with no
+// comma/decimal is never a real Basic amount on this template (always
+// printed "1,234.00"), so null it out and let the arithmetic/consensus rules
+// below fill it back in from Amount - never fabricate, just stop trusting
+// a value that's provably not a Basic amount.
+function applyBasicHsnLeakRule(items, warnings) {
+  return items.map(item => {
+    if (typeof item.basic === 'string' && /^99\d7\d\d$/.test(item.basic.trim())) {
+      warnings.push(`Row (SR ${item.srNo ?? 'unknown'}) basic "${item.basic}" discarded - it's an HSN/SAC-shaped code, not a Basic amount (column-shift, deterministic rule).`)
+      return { ...item, basic: null }
+    }
+    return item
+  })
+}
+
 // -- RULE B: row arithmetic repair (basic x quantity = amount) --------------------
 
 function deriveMissingField(basicStr, qtyStr, amountStr, warnings, srNo) {
@@ -1406,6 +1422,7 @@ function applyDescriptionNormalizationRule(items, warnings) {
 function normalizePart2LineItems(items, warnings, totals = null) {
   if (!Array.isArray(items) || items.length === 0) return items
   let result = applyHsnJunkRule(items, warnings)
+  result = applyBasicHsnLeakRule(result, warnings)
   result = applyHsnMajorityRule(result, warnings)
   result = applyRowArithmeticRule(result, warnings)
   if (totals) {
